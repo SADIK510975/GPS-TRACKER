@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Live GPS Tracker</title>
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#ffffff; --text:#14161a; --muted:#6b7280;
+    --accent:#2563eb; --border:#e5e7eb; --ok:#16a34a; --warn:#d97706;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0f1115; --card:#181b21; --text:#f2f3f5; --muted:#9aa1ac; --accent:#5b8def; --border:#2a2e37; }
+  }
+  *{box-sizing:border-box;}
+  body{margin:0; background:var(--bg); color:var(--text);
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+  .wrap{max-width:480px; margin:0 auto; padding:20px 16px 40px;}
+  h1{font-size:1.3rem; margin:4px 0 2px;}
+  .sub{color:var(--muted); font-size:.85rem; margin-bottom:20px;}
+  .card{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:18px; margin-bottom:16px;}
+  .row{display:flex; justify-content:space-between; padding:7px 0; border-bottom:1px solid var(--border); font-size:.92rem;}
+  .row:last-child{border-bottom:none;}
+  .row span:first-child{color:var(--muted);}
+  .coords{font-size:1.5rem; font-weight:600; margin:4px 0 10px; word-break:break-word;}
+  .badge{display:inline-block; padding:3px 10px; border-radius:999px; font-size:.75rem; font-weight:600;}
+  .badge.live{background:rgba(22,163,74,.15); color:var(--ok);}
+  .badge.stale{background:rgba(217,119,6,.15); color:var(--warn);}
+  .badge.none{background:rgba(107,114,128,.15); color:var(--muted);}
+  a.btn, button.btn{display:block; width:100%; text-align:center; text-decoration:none;
+    background:var(--accent); color:#fff; border:none; border-radius:10px;
+    padding:12px; font-size:.95rem; font-weight:600; cursor:pointer; margin-top:10px;}
+  button.btn.secondary{background:transparent; color:var(--accent); border:1px solid var(--accent);}
+  .log{font-family:ui-monospace,monospace; font-size:.75rem; color:var(--muted);
+       max-height:120px; overflow-y:auto; white-space:pre-wrap; margin-top:10px;}
+  .section-title{font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-bottom:8px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📍 Live GPS Tracker</h1>
+  <div class="sub">Anyone with this link can see the latest location below.</div>
+
+  <div class="card">
+    <div class="section-title">Current location</div>
+    <span id="statusBadge" class="badge none">No data yet</span>
+    <div class="coords" id="coordsText">—</div>
+    <div class="row"><span>Altitude</span><span id="alt">—</span></div>
+    <div class="row"><span>Speed</span><span id="speed">—</span></div>
+    <div class="row"><span>Satellites</span><span id="sats">—</span></div>
+    <div class="row"><span>Last update</span><span id="age">—</span></div>
+    <a class="btn" id="mapLink" href="#" target="_blank" rel="noopener">Open in Google Maps</a>
+  </div>
+
+  <div class="card">
+    <div class="section-title">Relay from device (this phone)</div>
+    <div class="sub" style="margin-bottom:10px;">
+      Only needed on the phone that's Bluetooth-paired with the ESP32-GPS tracker.
+      Requires Chrome on Android or desktop (Web Bluetooth).
+    </div>
+    <button class="btn secondary" id="connectBtn">Connect to ESP32-GPS</button>
+    <div class="log" id="log"></div>
+  </div>
+</div>
+
+<script>
+// ---- Config ----
+const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+// Unique, hard-to-guess public relay topic (acts as the "shared storage").
+// Change this string if you want a fresh, private channel.
+const NTFY_TOPIC = "gps-8a1eceefd55c";
+const NTFY_BASE = "https://ntfy.sh/" + NTFY_TOPIC;
+
+function log(msg){
+  const el = document.getElementById("log");
+  el.textContent = (new Date().toLocaleTimeString() + "  " + msg + "\n") + el.textContent;
+}
+
+function parseLine(line){
+  const coord = line.match(/(-?\d+\.\d+)\s*([NS]),\s*(-?\d+\.\d+)\s*([EW])/);
+  if (!coord) return null;
+  let lat = parseFloat(coord[1]) * (coord[2] === "S" ? -1 : 1);
+  let lon = parseFloat(coord[3]) * (coord[4] === "W" ? -1 : 1);
+  const alt = line.match(/Alt\s+(-?\d+\.\d+)/);
+  const speed = line.match(/(-?\d+\.\d+)\s*km\/h/);
+  const sats = line.match(/Sats\s+(\d+)/);
+  return {
+    lat, lon,
+    alt: alt ? parseFloat(alt[1]) : null,
+    speed: speed ? parseFloat(speed[1]) : null,
+    sats: sats ? parseInt(sats[1]) : null,
+    live: line.includes("LIVE"),
+    updatedAt: Date.now()
+  };
+}
+
+let latestFix = null;
+
+function renderFix(fix){
+  const badge = document.getElementById("statusBadge");
+  const coordsText = document.getElementById("coordsText");
+  const mapLink = document.getElementById("mapLink");
+  if (!fix){
+    badge.className = "badge none"; badge.textContent = "No data yet";
+    coordsText.textContent = "—";
+    return;
+  }
+  const ageSec = Math.round((Date.now() - fix.updatedAt)/1000);
+  const stale = ageSec > 120;
+  badge.className = "badge " + (stale ? "stale" : "live");
+  badge.textContent = stale ? "Stale" : (fix.live ? "Live" : "Last known");
+  coordsText.textContent = fix.lat.toFixed(6) + ", " + fix.lon.toFixed(6);
+  document.getElementById("alt").textContent = fix.alt != null ? fix.alt.toFixed(1) + " m" : "—";
+  document.getElementById("speed").textContent = fix.speed != null ? fix.speed.toFixed(1) + " km/h" : "—";
+  document.getElementById("sats").textContent = fix.sats != null ? fix.sats : "—";
+  document.getElementById("age").textContent = ageSec < 60 ? ageSec + " s ago" : (Math.floor(ageSec/60) + " min ago");
+  mapLink.href = "https://maps.google.com/?q=" + fix.lat.toFixed(6) + "," + fix.lon.toFixed(6);
+}
+
+setInterval(() => { if (latestFix) renderFix(latestFix); }, 5000);
+
+// ---- Viewer: subscribe to live updates via ntfy SSE ----
+function startViewer(){
+  // Load the last known fix first
+  fetch(NTFY_BASE + "/json?poll=1&since=all")
+    .then(r => r.text())
+    .then(text => {
+      const lines = text.trim().split("\n").filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--){
+        try {
+          const evt = JSON.parse(lines[i]);
+          if (evt.message){
+            latestFix = JSON.parse(evt.message);
+            renderFix(latestFix);
+            break;
+          }
+        } catch(e){}
+      }
+    }).catch(()=>{});
+
+  const es = new EventSource(NTFY_BASE + "/sse");
+  es.onmessage = (e) => {
+    try {
+      const evt = JSON.parse(e.data);
+      if (evt.message){
+        latestFix = JSON.parse(evt.message);
+        renderFix(latestFix);
+      }
+    } catch(err){}
+  };
+}
+startViewer();
+
+// ---- Relay: connect to ESP32 and publish fixes to ntfy ----
+document.getElementById("connectBtn").addEventListener("click", async () => {
+  if (!navigator.bluetooth){
+    log("Web Bluetooth not supported in this browser (use Chrome on Android/desktop).");
+    return;
+  }
+  try {
+    log("Requesting device...");
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }]
+    });
+    log("Connecting to " + device.name + "...");
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    const txChar = await service.getCharacteristic(TX_UUID);
+    await txChar.startNotifications();
+    log("Connected. Listening for location updates...");
+
+    let buffer = "";
+    txChar.addEventListener("characteristicvaluechanged", (event) => {
+      const chunk = new TextDecoder().decode(event.target.value);
+      buffer += chunk;
+      let idx;
+      while ((idx = buffer.indexOf("\n")) >= 0){
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        const fix = parseLine(line);
+        if (fix){
+          latestFix = fix;
+          renderFix(fix);
+          fetch(NTFY_BASE, { method: "POST", body: JSON.stringify(fix) })
+            .catch(e => log("Publish failed: " + e.message));
+        }
+      }
+    });
+
+    device.addEventListener("gattserverdisconnected", () => log("Disconnected."));
+  } catch(e){
+    log("Connection failed: " + e.message);
+  }
+});
+</script>
+</body>
+</html>
